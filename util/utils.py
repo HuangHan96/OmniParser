@@ -3,6 +3,13 @@ import os
 import io
 import base64
 import time
+import tempfile
+import subprocess
+_RUNTIME_CACHE_DIR = os.path.join(tempfile.gettempdir(), "omniparser-runtime")
+os.makedirs(_RUNTIME_CACHE_DIR, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(_RUNTIME_CACHE_DIR, "matplotlib"))
+os.environ.setdefault("YOLO_CONFIG_DIR", os.path.join(_RUNTIME_CACHE_DIR, "ultralytics"))
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 from PIL import Image, ImageDraw, ImageFont
 import json
 import requests
@@ -19,16 +26,140 @@ import numpy as np
 from matplotlib import pyplot as plt
 import easyocr
 from paddleocr import PaddleOCR
-reader = easyocr.Reader(['en'])
-paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
+HF_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+DEFAULT_ICON_DESCRIPTION = "icon"
+DEFAULT_OCR_LANGS = ('ch_sim', 'en')
+DEFAULT_OCR_BACKEND = 'easyocr'
+VISION_OCR_SOURCE_PATH = os.path.join(os.path.dirname(__file__), 'vision_ocr.swift')
+VISION_OCR_BINARY_PATH = os.path.join(_RUNTIME_CACHE_DIR, 'vision_ocr')
+easyocr_readers = {}
+
+def _build_paddle_ocr():
+    kwargs = {
+        'lang': 'en',
+        'use_angle_cls': False,
+        'use_gpu': False,  # using cuda will conflict with pytorch in the same process
+        'show_log': False,
+        'use_dilation': True,  # improves accuracy
+        'det_db_score_mode': 'slow',  # improves accuracy
+        'max_batch_size': 1024,
+        'rec_batch_num': 1024,
+    }
+
+    while True:
+        try:
+            return PaddleOCR(**kwargs)
+        except TypeError:
+            unsupported = ['max_batch_size', 'rec_batch_num', 'use_dilation', 'det_db_score_mode']
+            trimmed = {k: v for k, v in kwargs.items() if k not in unsupported}
+            if trimmed == kwargs:
+                raise
+            kwargs = trimmed
+        except ValueError as error:
+            message = str(error)
+            if 'Unknown argument:' in message:
+                unknown_arg = message.split('Unknown argument:', 1)[1].strip()
+                if unknown_arg in kwargs:
+                    kwargs.pop(unknown_arg, None)
+                    continue
+            raise
+
+paddle_ocr = None
+
+def get_paddle_ocr():
+    global paddle_ocr
+    if paddle_ocr is None:
+        paddle_ocr = _build_paddle_ocr()
+    return paddle_ocr
+
+def normalize_ocr_langs(raw_langs):
+    if isinstance(raw_langs, (list, tuple)):
+        candidates = [str(lang).strip() for lang in raw_langs if str(lang).strip()]
+    else:
+        candidates = [part.strip() for part in str(raw_langs or '').split(',') if part.strip()]
+    return tuple(dict.fromkeys(candidates)) or DEFAULT_OCR_LANGS
+
+def _build_easyocr_reader(langs):
+    normalized_langs = normalize_ocr_langs(langs)
+    fallback_candidates = []
+    if normalized_langs:
+        fallback_candidates.append(normalized_langs)
+    if ('en',) not in fallback_candidates:
+        fallback_candidates.append(('en',))
+
+    resolved_device = resolve_torch_device('auto')
+    easyocr_gpu = resolved_device if resolved_device in {'cuda', 'mps'} else False
+    print(f'EasyOCR requested device={resolved_device}')
+
+    last_error = None
+    for candidate_langs in fallback_candidates:
+        try:
+            return easyocr.Reader(list(candidate_langs), gpu=easyocr_gpu, download_enabled=False), candidate_langs
+        except Exception as error:
+            last_error = error
+            continue
+    raise last_error or RuntimeError('failed to initialize EasyOCR reader')
+
+def get_easyocr_reader(langs=None):
+    normalized_langs = normalize_ocr_langs(langs)
+    cache_key = ','.join(normalized_langs)
+    if cache_key not in easyocr_readers:
+        reader, resolved_langs = _build_easyocr_reader(normalized_langs)
+        easyocr_readers[cache_key] = (reader, resolved_langs)
+        print(f'EasyOCR initialized with langs={list(resolved_langs)}')
+    return easyocr_readers[cache_key]
+
+
+def ensure_vision_ocr_binary():
+    if sys.platform != 'darwin':
+        raise RuntimeError('Vision OCR is only supported on macOS')
+    if not os.path.exists(VISION_OCR_SOURCE_PATH):
+        raise RuntimeError(f'Vision OCR source not found: {VISION_OCR_SOURCE_PATH}')
+
+    source_mtime = os.path.getmtime(VISION_OCR_SOURCE_PATH)
+    binary_ready = os.path.exists(VISION_OCR_BINARY_PATH) and os.path.getmtime(VISION_OCR_BINARY_PATH) >= source_mtime
+    if binary_ready:
+        return VISION_OCR_BINARY_PATH
+
+    compile_cmd = ['/usr/bin/swiftc', '-O', VISION_OCR_SOURCE_PATH, '-o', VISION_OCR_BINARY_PATH]
+    result = subprocess.run(compile_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'Failed to compile Vision OCR helper: {result.stderr.strip() or result.stdout.strip()}')
+    return VISION_OCR_BINARY_PATH
+
+
+def run_vision_ocr(image_source, ocr_langs=None):
+    binary_path = ensure_vision_ocr_binary()
+    normalized_langs = normalize_ocr_langs(ocr_langs)
+
+    with tempfile.NamedTemporaryFile(prefix='vision-ocr-', suffix='.jpg', dir=_RUNTIME_CACHE_DIR, delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        image_source.save(tmp_path, format='JPEG', quality=85)
+        result = subprocess.run(
+            [binary_path, tmp_path, ','.join(normalized_langs)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'Vision OCR failed')
+        payload = json.loads(result.stdout or '{}')
+        items = payload.get('items') or []
+        text = [str(item.get('text') or '').strip() for item in items if str(item.get('text') or '').strip()]
+        boxes = []
+        for item in items:
+            bbox = item.get('bbox') or []
+            if len(bbox) < 4:
+                continue
+            x1, y1, x2, y2 = [int(round(float(v))) for v in bbox[:4]]
+            boxes.append([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
+        return text, boxes, normalized_langs
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 import time
 import base64
 
@@ -43,35 +174,110 @@ import supervision as sv
 import torchvision.transforms as T
 from util.box_annotator import BoxAnnotator 
 
+def resolve_cached_snapshot_path(model_id):
+    normalized_id = str(model_id or '').strip()
+    if not normalized_id:
+        return ''
+
+    cache_root = os.path.join(HF_CACHE_DIR, f"models--{normalized_id.replace('/', '--')}")
+    refs_main_path = os.path.join(cache_root, 'refs', 'main')
+    try:
+        if os.path.exists(refs_main_path):
+            snapshot_id = open(refs_main_path, 'r', encoding='utf-8').read().strip()
+            snapshot_path = os.path.join(cache_root, 'snapshots', snapshot_id)
+            if os.path.exists(snapshot_path):
+                return snapshot_path
+    except Exception:
+        pass
+    return ''
+
+def has_florence_processor_files(model_path):
+    if not model_path:
+        return False
+
+    required_files = [
+        'preprocessor_config.json',
+        'tokenizer.json',
+        'tokenizer_config.json',
+        'special_tokens_map.json',
+        'vocab.json',
+        'merges.txt',
+    ]
+    return all(os.path.exists(os.path.join(model_path, filename)) for filename in required_files)
+
+def resolve_florence_processor_source(model_name_or_path):
+    candidates = [
+        model_name_or_path,
+        resolve_cached_snapshot_path('microsoft/Florence-2-base'),
+        resolve_cached_snapshot_path('microsoft/Florence-2-base-ft'),
+    ]
+    for candidate in candidates:
+        if has_florence_processor_files(candidate):
+            return candidate, True
+    return "microsoft/Florence-2-base", False
+
+
+def resolve_torch_device(requested_device=None):
+    requested = str(requested_device or 'auto').strip().lower()
+    mps_backend = getattr(torch.backends, 'mps', None)
+    mps_available = bool(mps_backend and mps_backend.is_available())
+
+    if requested in {'', 'auto'}:
+        if torch.cuda.is_available():
+            return 'cuda'
+        if mps_available:
+            return 'mps'
+        return 'cpu'
+
+    if requested == 'cuda':
+        if torch.cuda.is_available():
+            return 'cuda'
+        print('CUDA requested but unavailable, falling back to CPU')
+        return 'cpu'
+
+    if requested == 'mps':
+        if mps_available:
+            return 'mps'
+        print('MPS requested but unavailable, falling back to CPU')
+        return 'cpu'
+
+    if requested == 'cpu':
+        return 'cpu'
+
+    print(f'Unknown device "{requested}", falling back to auto selection')
+    return resolve_torch_device('auto')
+
 
 def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2-opt-2.7b", device=None):
-    if not device:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_torch_device(device)
+    dtype = torch.float32 if device == 'cpu' else torch.float16
     if model_name == "blip2":
         from transformers import Blip2Processor, Blip2ForConditionalGeneration
         processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
-        if device == 'cpu':
-            model = Blip2ForConditionalGeneration.from_pretrained(
-            model_name_or_path, device_map=None, torch_dtype=torch.float32
-        ) 
-        else:
-            model = Blip2ForConditionalGeneration.from_pretrained(
-            model_name_or_path, device_map=None, torch_dtype=torch.float16
-        ).to(device)
+        model = Blip2ForConditionalGeneration.from_pretrained(
+            model_name_or_path, device_map=None, torch_dtype=dtype
+        )
     elif model_name == "florence2":
-        from transformers import AutoProcessor, AutoModelForCausalLM 
-        processor = AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
-        if device == 'cpu':
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True)
-        else:
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, trust_remote_code=True).to(device)
+        from transformers import Florence2Processor, Florence2ForConditionalGeneration
+        processor_source, local_files_only = resolve_florence_processor_source(model_name_or_path)
+        processor = Florence2Processor.from_pretrained(processor_source, local_files_only=local_files_only)
+        model = Florence2ForConditionalGeneration.from_pretrained(model_name_or_path, torch_dtype=dtype)
+    else:
+        raise ValueError(f'Unsupported caption model: {model_name}')
     return {'model': model.to(device), 'processor': processor}
 
 
-def get_yolo_model(model_path):
+def get_yolo_model(model_path, device=None):
     from ultralytics import YOLO
-    # Load the model.
     model = YOLO(model_path)
+    resolved_device = resolve_torch_device(device)
+    try:
+        model.to(resolved_device)
+    except Exception as error:
+        print(f'Failed to move YOLO model to {resolved_device}: {error}')
+        resolved_device = 'cpu'
+        model.to(resolved_device)
+    setattr(model, '_omniparser_device', resolved_device)
     return model
 
 
@@ -107,10 +313,13 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
         start = time.time()
         batch = croped_pil_image[i:i+batch_size]
         t1 = time.time()
+        input_kwargs = {'device': device}
+        if model.device.type != 'cpu' and model.dtype in (torch.float16, torch.bfloat16):
+            input_kwargs['dtype'] = model.dtype
         if model.device.type == 'cuda':
-            inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt", do_resize=False).to(device=device, dtype=torch.float16)
+            inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt", do_resize=False).to(**input_kwargs)
         else:
-            inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt").to(device=device)
+            inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt").to(**input_kwargs)
         if 'florence' in model.config.name_or_path:
             generated_ids = model.generate(input_ids=inputs["input_ids"],pixel_values=inputs["pixel_values"],max_new_tokens=20,num_beams=1, do_sample=False)
         else:
@@ -305,7 +514,7 @@ def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None):
                     else:
                         filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': None, 'source':'box_yolo_content_yolo'})
             else:
-                filtered_boxes.append(box1)
+                filtered_boxes.append(box1_elem)
     return filtered_boxes # torch.tensor(filtered_boxes)
 
 
@@ -378,20 +587,17 @@ def predict(model, image, caption, box_threshold, text_threshold):
 def predict_yolo(model, image, box_threshold, imgsz, scale_img, iou_threshold=0.7):
     """ Use huggingface model to replace the original model
     """
-    # model = model['model']
+    predict_kwargs = {
+        'source': image,
+        'conf': box_threshold,
+        'iou': iou_threshold,
+    }
     if scale_img:
-        result = model.predict(
-        source=image,
-        conf=box_threshold,
-        imgsz=imgsz,
-        iou=iou_threshold, # default 0.7
-        )
-    else:
-        result = model.predict(
-        source=image,
-        conf=box_threshold,
-        iou=iou_threshold, # default 0.7
-        )
+        predict_kwargs['imgsz'] = imgsz
+    model_device = getattr(model, '_omniparser_device', None)
+    if model_device:
+        predict_kwargs['device'] = model_device
+    result = model.predict(**predict_kwargs)
     boxes = result[0].boxes.xyxy#.tolist() # in pixel space
     conf = result[0].boxes.conf
     phrases = [str(i) for i in range(len(boxes))]
@@ -431,7 +637,13 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
         print('no ocr bbox!!!')
         ocr_bbox = None
 
-    ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
+    ocr_bbox_elem = []
+    if ocr_bbox:
+        ocr_bbox_elem = [
+            {'type': 'text', 'bbox': box, 'interactivity': False, 'content': txt, 'source': 'box_ocr_content_ocr'}
+            for box, txt in zip(ocr_bbox, ocr_text)
+            if int_box_area(box, w, h) > 0
+        ]
     xyxy_elem = [{'type': 'icon', 'bbox':box, 'interactivity':True, 'content':None} for box in xyxy.tolist() if int_box_area(box, w, h) > 0]
     filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
     
@@ -444,7 +656,7 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
 
     # get parsed icon local semantics
     time1 = time.time()
-    if use_local_semantics:
+    if use_local_semantics and caption_model_processor:
         caption_model = caption_model_processor['model']
         if 'phi3_v' in caption_model.config.model_type: 
             parsed_content_icon = get_parsed_content_icon_phi3v(filtered_boxes, ocr_bbox, image_source, caption_model_processor)
@@ -461,6 +673,9 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
             parsed_content_icon_ls.append(f"Icon Box ID {str(i+icon_start)}: {txt}")
         parsed_content_merged = ocr_text + parsed_content_icon_ls
     else:
+        for box in filtered_boxes_elem:
+            if box.get('type') == 'icon' and not box.get('content'):
+                box['content'] = DEFAULT_ICON_DESCRIPTION
         ocr_text = [f"Text Box ID {i}: {txt}" for i, txt in enumerate(ocr_text)]
         parsed_content_merged = ocr_text
     print('time to get parsed content:', time.time()-time1)
@@ -501,7 +716,7 @@ def get_xywh_yolo(input):
     x, y, w, h = int(x), int(y), int(w), int(h)
     return x, y, w, h
 
-def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, output_bb_format='xywh', goal_filtering=None, easyocr_args=None, use_paddleocr=False):
+def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, output_bb_format='xywh', goal_filtering=None, easyocr_args=None, use_paddleocr=False, ocr_langs=None):
     if isinstance(image_source, str):
         image_source = Image.open(image_source)
     if image_source.mode == 'RGBA':
@@ -509,18 +724,23 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
         image_source = image_source.convert('RGB')
     image_np = np.array(image_source)
     w, h = image_source.size
-    if use_paddleocr:
+    if use_paddleocr is True:
         if easyocr_args is None:
             text_threshold = 0.5
         else:
             text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
+        result = get_paddle_ocr().ocr(image_np, cls=False)[0]
         coord = [item[0] for item in result if item[1][1] > text_threshold]
         text = [item[1][0] for item in result if item[1][1] > text_threshold]
+    elif use_paddleocr == 'vision':
+        text, bb, resolved_langs = run_vision_ocr(image_source, ocr_langs)
+        coord = bb
+        print(f'Vision OCR initialized with langs={list(resolved_langs)}')
     else:  # EasyOCR
         if easyocr_args is None:
             easyocr_args = {}
-        result = reader.readtext(image_np, **easyocr_args)
+        easyocr_reader, resolved_langs = get_easyocr_reader(ocr_langs)
+        result = easyocr_reader.readtext(image_np, **easyocr_args)
         coord = [item[0] for item in result]
         text = [item[1] for item in result]
     if display_img:
